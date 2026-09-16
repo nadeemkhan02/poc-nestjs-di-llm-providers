@@ -1,82 +1,23 @@
-# Dependency Injection in NestJS: How We Learned to Stop Hard-Coding Our LLM and Started Injecting It
+# Dependency Injection in NestJS: Building a Multi-LLM Provider Architecture
 
-A few months ago, a seemingly simple requirement landed on our plate: *"the app should be able to talk to more than one LLM, and the customer should be able to choose which one, without us shipping a new build every time."*
+Software architecture rarely announces itself as important. It usually shows up disguised as a small ticket. Ours read: *"the app should be able to talk to more than one LLM, and the customer should be able to choose which one, without us shipping a new build every time."*
 
-On paper, that sounds like a one-line config change. In practice, it's the kind of requirement that quietly punishes a codebase for every shortcut it ever took. If you've ever grep'd your entire project for `new OpenAI(...)` because a vendor changed their pricing and someone said "let's also support DeepSeek," you already know the feeling.
+That single sentence is why this post exists. What looked like a config tweak turned into a real lesson in **Dependency Injection (DI)** — what it is, why NestJS is built around it, and how it let us swap AI vendors with a one-line environment variable instead of a redeploy.
 
-This post is the story of that problem, and the pattern that got us out of it: **Dependency Injection (DI)**. We'll start from first principles — what DI actually is, in plain English — then walk through exactly how NestJS implements it, and finally build a real, working multi-LLM-provider architecture step by step, the same one we shipped. Every code snippet in this post is real code, not pseudocode — you can find it in [this repository](.).
+In this post, I'll walk through what DI actually means, the problem that forced our hand, the architecture we landed on, and the exact implementation, step by step, with the real code from the project. Whether you're new to NestJS or you've used `@Injectable()` a hundred times without thinking about what it's really doing, this should give you a working mental model you can reuse on your own multi-provider problems.
 
----
+## The Problem: One App, Several LLM Vendors
 
-## 1. What Dependency Injection Actually Is
+If you've ever maintained a service that calls a single AI vendor, you know it starts simple: import the SDK, call it, done. The trouble starts the moment a second vendor enters the picture. The challenges go beyond just adding another API call:
 
-Strip away the framework jargon and DI is a surprisingly small idea:
+- **Every vendor has its own SDK shape.** OpenAI's request/response format isn't DeepSeek's. A naive integration bakes vendor-specific shapes into whatever service calls it.
+- **The choice has to be a runtime decision, not a code decision.** Different customers want different vendors — for cost, for compliance, for latency. Nobody wants a rebuild and redeploy just to flip that switch.
+- **More vendors are always coming.** Whatever we built for vendor #2 had to not require rewriting anything when vendor #3 showed up.
+- **Business logic shouldn't know or care which vendor is active.** The code that turns a prompt into a response has nothing to do with whose API key is in play.
 
-> **Don't let a class build the things it depends on. Hand those things to it instead.**
+These constraints make "just call the LLM" a genuinely different problem from "call whichever LLM the customer configured, and let us add more without touching what already works."
 
-That's it. That's the whole concept. Everything else — containers, tokens, providers, modules — is just tooling built around that one sentence.
-
-### A tiny example, without DI
-
-Imagine a class that needs to send a notification:
-
-```ts
-class OrderService {
-  private emailer = new SmtpEmailer(); // OrderService built its own dependency
-
-  placeOrder(order: Order) {
-    // ... business logic
-    this.emailer.send(order.customerEmail, 'Order confirmed');
-  }
-}
-```
-
-This looks harmless until you actually have to live with it:
-
-- Want to send SMS instead of email for some customers? You're editing `OrderService`.
-- Want to unit-test `placeOrder()` without actually hitting an SMTP server? Good luck — `SmtpEmailer` is baked in.
-- Want two different notification channels active at once, chosen per customer? Now you're writing `if/else` branches inside business logic that has nothing to do with notifications.
-
-`OrderService` is **tightly coupled** to `SmtpEmailer`. It knows too much about *how* the notification happens, when all it should care about is *that* it happens.
-
-### The same example, with DI
-
-```ts
-interface Notifier {
-  send(to: string, message: string): Promise<void>;
-}
-
-class OrderService {
-  constructor(private readonly notifier: Notifier) {} // handed to it, not built by it
-
-  placeOrder(order: Order) {
-    // ... business logic
-    this.notifier.send(order.customerEmail, 'Order confirmed');
-  }
-}
-```
-
-`OrderService` now depends on an **interface**, not a concrete class. Something *outside* `OrderService` — a caller, a framework, a "container" — decides at construction time whether that's an `SmtpEmailer`, an `SmsNotifier`, or a `FakeNotifierForTests`. `OrderService` itself never changes.
-
-That's the entire payoff of DI:
-
-- **Swappable implementations** — change behavior without touching the class that uses it.
-- **Testability** — inject a fake/mock in tests, a real one in production.
-- **Single Responsibility** — a class focuses on its own logic, not on wiring up its collaborators.
-
-Doing this by hand for a handful of classes is manageable. Doing it by hand across a real application — where `OrderService` needs a `Notifier`, which needs a `ConfigService`, which needs a `Logger`, which needs... — turns into a wiring nightmare. That's the problem an **IoC (Inversion of Control) container** solves, and it's exactly what NestJS gives you out of the box.
-
----
-
-## 2. Our Actual Problem: One App, Several LLM Vendors, One Runtime Switch
-
-Here's the situation we were actually in. Our service needed to call an LLM to generate text. Simple enough — until the requirements grew:
-
-- Some customers wanted OpenAI. Others, for cost or compliance reasons, wanted DeepSeek.
-- The choice had to be a **runtime configuration**, not a code branch — nobody wanted to redeploy the app just to flip a vendor.
-- We knew a third, fourth, fifth provider was coming eventually. Whatever we built had to *not* require rewriting existing code every time that happened.
-
-The naive version of this — the one every team writes first — looks like:
+The instinctive first attempt looks like this:
 
 ```ts
 class LlmService {
@@ -91,53 +32,33 @@ class LlmService {
 }
 ```
 
-This works for exactly one vendor swap before it becomes a liability. Every new vendor adds another `else if`. Vendor-specific SDK calls, auth headers, and response-shape parsing all live *inside* the same file as the business logic that has nothing to do with any of that. Testing `LlmService` means testing every branch, every vendor's quirks, all at once. And this branch — this exact `if/else` — is the thing that eventually gets copy-pasted into every other service that also needs to call an LLM.
+It works for exactly one vendor swap before it becomes a liability. Every new vendor adds another `else if`. Vendor-specific SDK calls, auth headers, and response parsing all end up living inside code that's supposed to be about business logic, not about who's currently answering the phone.
 
-We'd basically recreated the `OrderService`/`SmtpEmailer` problem, just with a vendor name instead of a notification channel. So we reached for the same fix: stop letting the service know *which* vendor it's talking to. Make it depend on an interface, and let something else decide, at runtime, what sits behind that interface.
+## Why Dependency Injection Makes Sense
 
-That "something else" is exactly what NestJS's DI system is built to do.
+After running into this wall, the fix wasn't a clever trick — it was going back to a principle NestJS is built entirely around: **don't let a class build the things it depends on; hand those things to it instead.**
 
----
+**It decouples business logic from vendor code.**
+A service that depends on an `LlmProvider` interface, instead of a concrete `OpenAiClient` or `DeepSeekClient`, never has to change when a vendor's SDK changes, or when a new vendor is added. TypeScript's structural typing means anything that implements the interface's shape can stand in for anything else that does.
 
-## 3. How NestJS Implements Dependency Injection
+**Switching providers is a runtime decision, not a redeploy.**
+With the vendor bound to a DI *token* rather than hard-coded into an import, which concrete class fills that token is decided once, at application bootstrap, from configuration — not baked into the compiled code.
 
-NestJS doesn't just support DI as a nice-to-have pattern — it's the backbone of the framework. Three concepts do all the work: **the IoC container**, **providers**, and **modules**.
+**It scales without breaking anything already working.**
+Adding a sixth vendor means adding a class and a couple of registration lines. It never means touching the service, the controller, or any other consumer that already works today.
 
-### 3.1 The IoC Container
+**It's testable by design.**
+Inject a fake `LlmProvider` in a test and you can assert business logic in complete isolation from any real vendor, any network call, any flakiness.
 
-When your app boots, NestJS builds a dependency graph of every class you've registered, figures out what each one needs in its constructor, instantiates them in the right order, and hands each class its dependencies automatically. You never write `new LlmService(new SomeDependency())` yourself — Nest does it for you, based on constructor parameter types and `@Inject()` decorators.
+NestJS doesn't just make this pattern possible — it's the backbone of the framework. Three pieces do the work: the **IoC container** (builds the dependency graph and instantiates classes for you, instead of you calling `new` everywhere), **providers** (anything Nest can inject — a service, a value, or the result of a factory function bound to a token), and **modules** (which group providers and controllers, and can even compute their provider list dynamically at runtime).
 
-This is the "container" in Inversion of Control: control over *object creation* is inverted, taken away from your classes and handed to the framework.
+## Architecture That Works
 
-### 3.2 Providers
-
-A **provider** is anything Nest can inject: a service, a repository, a factory, a plain value. Providers are declared in a module's `providers` array, and by default Nest binds a provider to its own class as the lookup key.
-
-But Nest lets you go further than "class maps to itself." You can tell Nest: *"when someone asks for this token, run this value instead"*:
-
-```ts
-{ provide: SomeToken, useClass: SomeImplementation }
-{ provide: SomeToken, useValue: someObject }
-{ provide: SomeToken, useFactory: () => computeSomething() }
-```
-
-That `provide` key doesn't have to be a class — it can be a string, or better, a `Symbol`. This is the mechanism that decouples *what a consumer asks for* from *what actually gets built*, and it's the single most important trick in this entire post.
-
-### 3.3 Modules
-
-A `@Module()` groups related providers and controllers together, declares what it needs from other modules (`imports`), and what it's willing to share (`exports`). Modules are how a Nest app stays organized as it grows — and, as we'll see, a module can even compute its own provider list dynamically, based on configuration.
-
-With those three pieces, here's how we actually built the multi-vendor LLM architecture.
-
----
-
-## 4. The Implementation, Step by Step
-
-Here's the target we're building toward:
+Here's the shape we landed on:
 
 ```
                         ┌─────────────────────┐
-HTTP request ────────▶  │   LlmController      │
+HTTP request ────────▶ │   LlmController      │
                         └──────────┬───────────┘
                                    │ depends only on
                                    ▼
@@ -163,11 +84,32 @@ HTTP request ────────▶  │   LlmController      │
                     env var: LLM_PROVIDER=openai|deepseek
 ```
 
-Everything above the `LLM_PROVIDER` line has zero idea that OpenAI or DeepSeek exist. That's the whole point.
+### Core components
 
-### Step 1 — Define the contract
+1. **`LlmProvider` interface** — the contract every vendor implementation has to satisfy.
+2. **Concrete providers** (`OpenAiProvider`, `DeepSeekProvider`) — one class per vendor, each self-contained.
+3. **`LlmProviderRegistry`** — a lookup table mapping vendor name to provider instance.
+4. **A factory provider bound to `LLM_PROVIDER`** — reads config, asks the registry for the right instance, and that becomes the app-wide singleton.
+5. **`LlmModule.forRoot()`** — a dynamic module wiring all of the above into one self-contained unit.
+6. **`LlmService` / `LlmController`** — the consumers, which know none of the above exists.
 
-Before writing a single line of vendor code, we wrote the interface every vendor has to honor:
+### The request flow, step by step
+
+1. Nest boots `AppModule`, which imports `LlmModule.forRoot()`.
+2. `LlmModule.forRoot()` registers `ConfigModule`, both concrete providers, the registry, a bootstrap provider, the `LLM_PROVIDER` factory provider, and `LlmService`.
+3. At startup, the bootstrap provider runs once: it takes the already-instantiated `OpenAiProvider` and `DeepSeekProvider` and registers each into `LlmProviderRegistry` under its own vendor name.
+4. The `LLM_PROVIDER` factory provider runs next. It reads the `LLM_PROVIDER` env var via `ConfigService` and asks the registry for the matching instance. Whatever it returns becomes the singleton bound to the `LLM_PROVIDER` token for the app's lifetime.
+5. A request hits `POST /llm/generate`. `LlmController` validates the body and calls `LlmService.generate(...)`.
+6. `LlmService` calls `.generate()` on whatever `LlmProvider` it was injected with — no branch, no vendor name in sight.
+7. The concrete provider returns an `LlmResponse`. A real integration would make the actual vendor API call at this exact point.
+
+## Technical Implementation
+
+Let's get into the actual code — every snippet below is real, from the project.
+
+### Defining the contract
+
+Before writing any vendor code, we wrote the interface every vendor has to honor:
 
 ```ts
 // src/llm/interfaces/llm-provider.interface.ts
@@ -188,11 +130,11 @@ export interface LlmProvider {
 }
 ```
 
-This is the contract. From here on, nothing outside `src/llm/providers/` is allowed to import a concrete provider class — only this interface. That rule is what makes vendors truly interchangeable.
+Nothing outside `src/llm/providers/` is allowed to import a concrete provider class from here on — only this interface.
 
-### Step 2 — Create a DI token
+### DI tokens
 
-An interface disappears at compile time — TypeScript interfaces don't exist at runtime, so you can't `@Inject(LlmProvider)`. Nest needs something real to key its container on. That's a **token**:
+Interfaces disappear at compile time, so Nest needs something real to key its container on:
 
 ```ts
 // src/llm/tokens/llm.tokens.ts
@@ -204,11 +146,11 @@ export enum LlmVendor {
 }
 ```
 
-We used a `Symbol` instead of a plain string. It costs nothing, and it guarantees this token can never accidentally collide with some other `'LLM_PROVIDER'` string token elsewhere in a larger application.
+We used a `Symbol` rather than a plain string — it costs nothing, and guarantees this token can never collide with an unrelated `'LLM_PROVIDER'` string token elsewhere in a larger app.
 
-### Step 3 — Implement the actual providers
+### Concrete provider implementations
 
-Each vendor gets its own class implementing `LlmProvider`, and — this is the important bit — each one injects `ConfigService` for its own credentials, instead of reaching into `process.env` directly:
+Each vendor gets its own class implementing `LlmProvider`, injecting `ConfigService` for its own credentials rather than reaching into `process.env` directly:
 
 ```ts
 // src/llm/providers/openai.provider.ts
@@ -227,7 +169,7 @@ export class OpenAiProvider implements LlmProvider {
   }
 
   generate(prompt: string, options?: LlmGenerateOptions): Promise<LlmResponse> {
-    // (In production this calls the real OpenAI API; simulated here.)
+    // A real integration calls the OpenAI API here.
     return Promise.resolve({
       provider: this.getName(),
       model: this.model,
@@ -239,9 +181,9 @@ export class OpenAiProvider implements LlmProvider {
 
 `DeepSeekProvider` is a mirror image, reading `DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL` instead. Neither class knows the other exists.
 
-### Step 4 — A registry instead of an `if/else`
+### The registry, instead of an if/else
 
-This is where we avoided recreating the exact `switch`-on-vendor-name problem we were trying to escape. Instead of a giant conditional somewhere picking a provider, each provider **registers itself** into a lookup table:
+Each provider **registers itself** into a lookup table — the Strategy pattern — rather than living inside a growing conditional:
 
 ```ts
 // src/llm/registry/llm-provider.registry.ts
@@ -265,11 +207,11 @@ export class LlmProviderRegistry {
 }
 ```
 
-This is the [Strategy pattern](https://refactoring.guru/design-patterns/strategy), and it scales the way an `if/else` never does: adding a sixth vendor never means editing this file.
+Adding a sixth vendor never means editing this file.
 
-### Step 5 — A factory provider that reads config and picks the vendor
+### The factory provider: turning an env var into an instance
 
-This is the piece that actually turns an environment variable into a live class instance. A **factory provider** tells Nest: *"don't just instantiate a class for this token — run this function, inject these arguments into it, and bind whatever it returns."*
+A **factory provider** tells Nest: "don't just instantiate a class for this token — run this function, inject these arguments, and bind whatever it returns."
 
 ```ts
 // src/llm/llm.module.ts (excerpt)
@@ -283,25 +225,11 @@ const llmProviderFactory: Provider = {
 };
 ```
 
-Notice the third entry in `inject`: `'LLM_PROVIDER_BOOTSTRAP'`. It's never touched inside the factory body — its only job is to force Nest's dependency graph to build the bootstrap provider (which populates the registry, see below) *before* this factory runs. Nest resolves providers by dependency graph, not by array order, so without this explicit edge, "did the registry get populated in time?" would depend on incidental ordering — exactly the kind of bug that works on your machine and breaks in CI.
+The `'LLM_PROVIDER_BOOTSTRAP'` entry in `inject` is never touched inside the factory body — its only job is to force Nest's dependency graph to build the bootstrap provider first, guaranteeing the registry is populated before this factory reads from it.
 
-The bootstrap provider itself:
+### Wiring it into a dynamic module
 
-```ts
-{
-  provide: 'LLM_PROVIDER_BOOTSTRAP',
-  inject: [LlmProviderRegistry, OpenAiProvider, DeepSeekProvider],
-  useFactory: (registry, openAiProvider, deepSeekProvider) => {
-    registry.register(openAiProvider);
-    registry.register(deepSeekProvider);
-    return true;
-  },
-}
-```
-
-### Step 6 — Wrap it all in a Dynamic Module
-
-Rather than scatter `OpenAiProvider`, `DeepSeekProvider`, the registry, and the factory across the app's root module, we packaged the entire thing behind a single call: `LlmModule.forRoot()`. This is a **dynamic module** — a module whose provider list is computed by a static method instead of hard-coded in the decorator:
+A dynamic module computes its provider list via a static method instead of hard-coding it in the decorator, keeping all the wiring in one place:
 
 ```ts
 // src/llm/llm.module.ts
@@ -326,23 +254,11 @@ export class LlmModule {
 }
 ```
 
-And the root module stays almost embarrassingly simple:
+`app.module.ts` stays almost embarrassingly simple: `imports: [LlmModule.forRoot()]`.
 
-```ts
-// src/app.module.ts
-@Module({
-  imports: [LlmModule.forRoot()],
-  controllers: [AppController, LlmController],
-  providers: [AppService],
-})
-export class AppModule {}
-```
+### Consuming it, knowing nothing
 
-Everything about *how* the vendor gets chosen is encapsulated inside `LlmModule`. `AppModule` doesn't know, and doesn't need to.
-
-### Step 7 — Consume it, knowing nothing
-
-This is the payoff. Here's the entire service that uses the LLM:
+Here's the entire service that uses the LLM:
 
 ```ts
 // src/llm/llm.service.ts
@@ -360,7 +276,7 @@ export class LlmService {
 }
 ```
 
-No `if`, no `switch`, no import of `OpenAiProvider` or `DeepSeekProvider`. `@Inject(LLM_PROVIDER)` asks the container for "whatever is bound to this token," and by the time this constructor runs, the factory from Step 5 has already made that decision. The controller sitting on top of this service is equally oblivious:
+And the controller on top of it never imports a vendor class either:
 
 ```ts
 // src/llm/llm.controller.ts
@@ -383,11 +299,98 @@ export class LlmController {
 }
 ```
 
-### Step 8 — Prove the switch actually works
+## Security and Configuration Considerations
 
-Claims like "you can swap vendors with zero code changes" are cheap until you test them. We wrote an integration test that boots `LlmModule.forRoot()` twice — once with `LLM_PROVIDER=openai`, once with `LLM_PROVIDER=deepseek` — and asserts `LlmService` resolves the correct vendor both times, without a single line of `LlmService` changing between runs.
+Even in a proof-of-concept with no real vendor calls, a few habits carry straight into production:
 
-You can see the same thing manually against the compiled build:
+- **Never commit real API keys.** `.env` is git-ignored; `.env.example` holds placeholders only, and that's the only file meant to be committed.
+- **Read all secrets through `ConfigService`, never `process.env` directly**, inside provider classes. It's one seam, and it's mockable in tests.
+- **Global `ValidationPipe` with `whitelist: true` and `forbidNonWhitelisted: true`** on every request DTO, so an unexpected field is rejected outright instead of silently ignored — this matters more, not less, once you're forwarding user-supplied prompts to a third-party vendor.
+- **Fail fast and loud on bad configuration.** An unrecognized `LLM_PROVIDER` value throws a descriptive error at bootstrap. A silent fallback to some default vendor would be far worse — it would look like it worked while quietly sending traffic to the wrong place.
+
+## Advanced Patterns That Make a Difference
+
+A couple of details in this design look small but matter a lot once the app grows.
+
+**Symbol tokens instead of string tokens.**
+`Symbol('LLM_PROVIDER')` guarantees uniqueness in a way a string literal never can. In a larger application with multiple modules, two unrelated features reusing the string `'LLM_PROVIDER'` as a token would silently collide; two `Symbol()` calls never can.
+
+**An explicit bootstrap dependency, not array-order luck.**
+
+```ts
+{
+  provide: 'LLM_PROVIDER_BOOTSTRAP',
+  inject: [LlmProviderRegistry, OpenAiProvider, DeepSeekProvider],
+  useFactory: (registry, openAiProvider, deepSeekProvider) => {
+    registry.register(openAiProvider);
+    registry.register(deepSeekProvider);
+    return true;
+  },
+}
+```
+
+Nest resolves providers by dependency graph, not by their position in the `providers` array. Depending on `'LLM_PROVIDER_BOOTSTRAP'` from the main factory turns "the registry happens to be populated first" into a guarantee the framework itself enforces.
+
+**`forRootAsync()` as the natural next step.**
+This project's config source (`ConfigService` reading `.env`) is synchronous and available at module definition time, so `forRoot()` is enough. The moment provider selection needs to come from something asynchronous — a remote feature-flag service, a database lookup — `forRootAsync()` is the same pattern with an async factory, no redesign required.
+
+## Benefits and Outcomes
+
+Once this was in place, the payoff showed up immediately:
+
+- **Zero code changes to add a vendor.** A new class, two registration lines, one `.env` entry — nothing in `LlmService`, `LlmController`, or any other consumer changes.
+- **Vendor switching became a one-line config change**, verifiable without touching a line of business logic.
+- **Tests got dramatically simpler.** `LlmService`'s tests inject a fake `LlmProvider` and assert delegation — no vendor SDK, no network mocking, no flakiness.
+- **Vendor-specific bugs stay vendor-specific.** A bug in how `DeepSeekProvider` builds its request body can't leak into `OpenAiProvider` or `LlmService`, because nothing shares code across that boundary except the interface.
+
+## Common Challenges (And How I Solved Them)
+
+**"Which provider gets built first?"**
+The registry needs both concrete providers registered before the factory reads from it — but Nest doesn't guarantee array order. The fix was making that ordering an explicit DI dependency (the `'LLM_PROVIDER_BOOTSTRAP'` token above) instead of hoping array position held.
+
+**"What happens with a typo in `LLM_PROVIDER`?"**
+Early on, an unrecognized value silently fell through. We changed `LlmProviderRegistry.get()` to throw immediately, naming the bad value and listing what's actually registered — a bootstrap-time crash is far easier to diagnose than a runtime `undefined` three layers deep.
+
+**"How do we prove switching actually works, not just that it compiles?"**
+Unit tests alone can't prove this — they test one provider or the registry in isolation. The fix was a dedicated integration test that boots the whole module twice, once per vendor, and asserts the resolved instance differs each time.
+
+## Environment Setup
+
+All values below are placeholders — this proof-of-concept never makes a real network call, so any string works for the key variables. They exist to demonstrate realistic config wiring, not to authenticate against a real vendor.
+
+```bash
+# .env
+LLM_PROVIDER=openai
+
+OPENAI_API_KEY=your-openai-api-key-placeholder
+OPENAI_MODEL=gpt-4o-mini
+
+DEEPSEEK_API_KEY=your-deepseek-api-key-placeholder
+DEEPSEEK_MODEL=deepseek-chat
+
+PORT=3000
+```
+
+```bash
+git clone https://github.com/nadeemkhan02/poc-nestjs-di-llm-providers.git
+cd poc-nestjs-di-llm-providers
+npm install
+cp .env.example .env
+npm run start:dev
+```
+
+## Testing Your Setup
+
+The core claim — "seamless switching" — is checked two ways.
+
+**Automated**, via an integration test that boots `LlmModule.forRoot()` twice in the same file, once per vendor, and asserts `LlmService.getActiveVendor()` and `.generate()` resolve correctly each time, with `LlmService`'s own source never changing:
+
+```bash
+npm test           # unit + integration tests, single run
+npm run test:cov   # coverage report
+```
+
+**Manual**, against the actual compiled build, if you want to see it with your own eyes:
 
 ```bash
 npm run build
@@ -400,29 +403,20 @@ LLM_PROVIDER=deepseek PORT=3111 node dist/main.js &
 curl http://localhost:3111/llm/active-provider   # {"activeProvider":"deepseek"}
 ```
 
-Same compiled `dist/main.js`, same controller, same service — only the environment variable changed. That's the requirement we started with, satisfied exactly as asked.
+Same compiled `dist/main.js`, same controller and service source — only the environment variable changed.
 
----
+## What's Next?
 
-## 5. Best Practices We Took Away From This
+A few natural extensions, not yet built:
 
-A few habits made this architecture hold up, and we'd carry them into any DI-heavy Nest module going forward:
+- **Wire a real HTTP call behind one provider**, guarded by an env flag, to prove the interface holds up against a real vendor response shape instead of a simulated one.
+- **Add a `forRootAsync()` variant** for a config source that's asynchronous — a remote feature-flag service deciding the active vendor, for example.
+- **Add a streaming variant of `LlmProvider.generate()`** (`AsyncIterable<string>`) once a real vendor call exists to stream tokens from, without changing the interface's shape for existing consumers.
 
-- **Depend on interfaces, not concrete classes, across module boundaries.** `LlmService` never imports a provider class directly — only the `LlmProvider` interface and the `LLM_PROVIDER` token.
-- **Confine vendor-specific code to one folder.** Nothing outside `src/llm/providers/` imports `OpenAiProvider` or `DeepSeekProvider` directly. If a vendor SDK changes its API, the blast radius is one file.
-- **Prefer a registry over a growing `if/else`/`switch`.** A lookup table is append-only and merge-conflict-free; a conditional chain is neither.
-- **Use `Symbol` tokens, not string tokens**, for anything beyond a quick prototype — they can't collide with an unrelated token of the same name elsewhere in the app.
-- **Make ordering explicit, not incidental.** The `'LLM_PROVIDER_BOOTSTRAP'` dependency edge exists purely so the DI graph — not array position — guarantees the registry is ready before it's read.
-- **Fail loudly on misconfiguration.** An unrecognized `LLM_PROVIDER` value throws a clear error at bootstrap. A silent fallback would have turned a typo into a support ticket weeks later.
-- **Reach for `forRoot()` when config is synchronous, `forRootAsync()` when it isn't.** If provider selection ever needed to come from a remote feature-flag service instead of `.env`, that's the natural next step — same shape, async factory.
-- **Write the integration test that proves the cross-cutting claim.** Unit tests proved each provider and the registry worked in isolation; only the integration test proved switching actually worked end to end.
+## Final Thoughts
 
----
+What started as a one-line ticket — "let customers pick their LLM" — turned into one of the more satisfying small architecture problems I've worked through, because the fix never got more complicated than the idea it started from: don't let a class build the thing it depends on, hand it the thing instead. NestJS's IoC container, providers, and dynamic modules are just the machinery that lets that one idea scale from a two-line constructor to a real, swappable, testable subsystem.
 
-## 6. Wrapping Up
+If you're facing a similar fork in the road — multiple implementations of the same idea, a runtime decision about which one to use, business logic that shouldn't have to care — it's worth reaching for this pattern before the first `if/else` on a vendor name makes it into your codebase. It's a lot cheaper to build it this way from day one than to refactor your way there after the third vendor shows up.
 
-What started as "just add a second LLM vendor" turned into a small but genuine architecture decision, and Dependency Injection is what made the right answer easy instead of painful. The core idea never got more complicated than the `OrderService`/`Notifier` example at the top of this post — a class asking for an interface instead of building a concrete implementation itself. NestJS's IoC container, providers, and dynamic modules are just the machinery that lets that idea scale from a two-line constructor to a real, swappable, testable subsystem.
-
-If you're facing a similar fork in the road — multiple implementations of the same idea, a runtime decision about which one to use, a business-logic layer that shouldn't have to care — this pattern is worth reaching for before the first `if/else` on a vendor name makes it into your codebase. It's much cheaper to build it this way from the start than to refactor your way there after the third vendor shows up.
-
-The full, runnable proof-of-concept — interfaces, tokens, both providers, the registry, the factory, the dynamic module, and the tests — lives in this repository if you want to see it end to end or use it as a starting template for your own multi-provider setup.
+The full, runnable proof-of-concept — interface, tokens, both providers, the registry, the factory, the dynamic module, and the tests — lives in this repository if you want to see it end to end or use it as a starting point for your own multi-provider setup. Good luck with your own implementation, and feel free to open an issue if you run into a rough edge.
